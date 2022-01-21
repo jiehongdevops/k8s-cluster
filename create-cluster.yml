@@ -1,0 +1,172 @@
+---
+- name: install k8s basic for both of master and nodes
+  hosts: all
+  become: yes
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  tasks:
+    - name: swap imformation
+      debug:
+        msg: swap size "{{ ansible_swaptotal_mb }}"
+    - name: disable swap
+      shell: |
+        swapoff -a && sed -i '/swap/ s/^\(.*\)$/#\1/g' /etc/fstab
+      when: ansible_swaptotal_mb != 0
+    - name: update packages
+      apt:
+        name: '*'
+        state: latest
+        force_apt_get: true
+    - name: install docker
+      apt:
+        name: docker.io
+        state: present
+    - name: host files
+      template:
+        src: templates/hostsfile.j2
+        dest: /etc/hosts
+    - name: make dir for k8s key
+      file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: '0755'
+    - name: check k8s repo key is exists
+      stat:
+        path: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      register: stat_k8s_key
+    - name: update key
+      uri:
+        dest: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      when: stat_k8s_key['stat']['exists'] == false
+    - name: check k8s repo source.list is exists
+      stat:
+        path: /etc/apt/sources.list.d/apt_kubernetes_io.list
+      register: stat_k8s_apt_source
+    - name: update repo.d file
+      block:
+         - apt_repository:
+             repo: deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main
+             state: present
+#           when: stat_k8s_apt_source['stat']['exists'] == true
+      rescue:
+        - name: copy repo file
+          copy:
+            src: files/k8s.repo
+            dest: /etc/apt/sources.list.d/kubernetes.list
+          when: stat_k8s_apt_source['stat']['exists'] == false
+        - name: module failed, update repo by shell
+          shell: |
+            apt -y update
+    - name: install k8s tools
+      apt:
+        name:
+          - iptables
+          - arptables
+          - "apt-transport-https"
+          - curl
+          - kubelet
+          - kubeadm
+          - kubectl
+    - name: update k8s configurations
+      lineinfile:
+        path: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        line: Environment="cgroup-driver=systemd/cgroup-driver=cgroupfs"
+        state: present
+    - name: check docker daemon config is existed
+      stat:
+        path: /etc/docker/daemon.json
+      register: stat_docker_daemon
+    - name: copy docker config
+      copy:
+        src: files/docker_dameon.json
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        owner: root
+        group: root
+      when: stat_docker_daemon['stat']['exists'] == false
+    - name: restart docker service
+      service:
+        name: docker
+        enabled: yes
+        state: restarted
+- name: config master
+  hosts: k8s_master
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  vars_files:
+    - vars/vars.yaml
+  become: yes
+  tasks:
+    - name: init control plane
+      shell: |
+        kubeadm init --service-cidr={{ servicecidr }} --apiserver-advertise-address={{ ansible_default_ipv4.address }} > {{ ansible_facts['env']['PWD'] }}/kubeadm.res
+- name: config master
+  hosts: k8s_master
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  become: yes
+  tasks:
+    - name: create .kube dir
+      file:
+        state: directory
+        path: "{{ ansible_facts['env']['PWD'] }}/.kube"
+        mode: '0755'
+    - name: cp admin.conf to user's home dir
+      copy:
+        remote_src: yes
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_facts['env']['PWD'] }}/.kube/config"
+        owner: "{{ ansible_facts['env']['USER'] }}"
+        group: "{{ ansible_facts['effective_group_id'] }}"
+    - name: create kubeadm.sh
+      shell: |
+        echo '#!/bin/bash' > {{ ansible_facts['env']['PWD'] }}/kubeadm.sh
+    - name: process kubeadm.res
+      shell: |
+        grep -e 'kubeadm' -e '--discovery-token-ca-cert-hash' {{ ansible_facts['env']['PWD'] }}/kubeadm.res | grep '^kube' -A 1 | sed 's/ *$//g' >> {{ ansible_facts['env']['PWD'] }}/kubeadm.sh
+    - name: delete kubeadm.res
+      file:
+        path: "{{ ansible_facts['env']['PWD'] }}/kubeadm.res"
+        state: absent
+    - name: fetch kubeadm.sh from k8s-master
+      fetch:
+        src: "{{ ansible_facts['env']['PWD'] }}/kubeadm.sh"
+        dest: ./
+        flat: yes
+- name: config workers
+  hosts: k8s_nodes
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  tasks:
+    - name: copy the join CMD
+      copy:
+        src: kubeadm.sh
+        dest: "{{ ansible_facts['env']['HOME'] }}/kubeadm.sh"
+        mode: '0777'
+- name: JOIN CLUSTER
+  hosts: k8s_nodes
+  become: yes
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  tasks:
+    - name: join the cluster
+      command: "{{ ansible_facts['env']['PWD'] }}/kubeadm.sh"
+- name: remove files
+  hosts: all
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  tasks:
+    - name: remove kubeadm.sh
+      file:
+        path: "{{ ansible_facts['env']['PWD'] }}/kubeadm.sh"
+        state: absent
+- name: install CNI (weave net)
+  hosts: k8s_master
+  vars:
+    - ansible_python_interpreter:  '/usr/bin/python3'
+  become: no
+  tasks:
+    - name: install weave net
+      shell: |
+        kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"

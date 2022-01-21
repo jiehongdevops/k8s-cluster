@@ -1,0 +1,50 @@
+---
+- name: config master
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - name: reset cluster master
+      shell: |
+        kubeadm reset --force
+    - name: init control plane
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_default_ipv4.address }} > ~/kubeadm.res
+    - name: cp admin.conf to .kube dir
+      shell: |
+        cp /etc/kubernetes/admin.conf ~/.kube/config
+    - name: create kubeadm.sh
+      shell: |
+        echo '#!/bin/bash' > ~/kubeadm.sh
+    - name: process kubeadm.res
+      shell: |
+        grep -e '^kubeadm' -e '--discovery-token-ca-cert-hash' ~/kubeadm.res | sed 's/ *$//g' >> ~/kubeadm.sh
+    - name: fetch kubeadm.sh from k8s-master
+      fetch:
+        src: ~/kubeadm.sh
+        dest: ./
+        flat: yes
+- name: config workers
+  hosts: k8s_nodes
+  become: yes
+  tasks:
+    - name: reset cluster workers
+      shell: |
+        kubeadm reset --force
+    - name: copy the join CMD
+      copy:
+        src: kubeadm.sh
+        dest: ~/kubeadm.sh
+    - name: change mode of kubeadm.sh
+      file:
+        path: ~/kubeadm.sh
+        mode: '0777'
+    - name: join the cluster
+      shell: |
+        ~/kubeadm.sh
+- name: install CNI (weave net)
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - name: install weave net
+      shell: |
+        kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
